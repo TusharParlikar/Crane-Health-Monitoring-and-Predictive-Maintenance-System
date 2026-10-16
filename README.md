@@ -133,3 +133,36 @@ Tested on 2026-10-16/17 on a Windows 11 laptop. The API ran as one uvicorn worke
 - **Not tested:** the Docker image and `docker compose`, because Docker isn't installed on the test machine.
 
 **Fixed during testing:** the first load test capped at 23 readings/s however many clients sent data. Profiling showed scikit-learn's `IsolationForest.score_samples` spent about 50 ms of Python overhead on each single reading. The API now looks up precomputed per-tree leaf scores, and training checks they match scikit-learn's own scores. That cut scoring from ~25 ms to ~6 ms and more than doubled throughput, with identical model output.
+
+## Project structure
+
+```
+crane/
+  sim.py        crane simulator: gradual wear + injected faults (training data and live client)
+  features.py   sliding-window features, shared by training and the API
+  train.py      offline training, cost-based threshold, evaluation report
+  scoring.py    online scoring: per-machine windows, health score, alert state
+  db.py         SQLAlchemy tables: readings (with scores) and alerts
+  api.py        FastAPI routes
+  client.py     fleet simulator that uploads every second and reports latency/throughput
+  dashboard.py  Streamlit live fleet dashboard
+tests/          API, validation, ranking and alert tests
+```
+
+## Limitations and next steps
+
+- Trained on simulated data only. Replaying NASA C-MAPSS / CWRU bearing data through the upload route is the next step.
+- Sliding windows live in API memory, so one API worker only (~50–65 cranes at 1 reading/s). Redis is the upgrade path for scale-out.
+- The Docker image and Compose stack are untested.
+- No authentication on the routes yet.
+- The health score formula is a simple heuristic.
+- About half of the anomaly alerts are false at the current cost setting.
+- Not built yet from the brief: WebSocket live updates and the optional PyTorch LSTM.
+
+## Tech stack
+
+Python · FastAPI · Pydantic · SQLAlchemy · PostgreSQL · NumPy · pandas · scikit-learn · XGBoost · joblib · Streamlit · Plotly · httpx · pytest · Docker Compose
+
+## Author
+
+Tushar Parlikar — [GitHub](https://github.com/TusharParlikar)
