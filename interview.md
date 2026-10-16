@@ -111,3 +111,104 @@ Interviewers usually care most about this section, so be ready to explain each c
 **Be upfront about this:** there is no public run-to-failure dataset for cranes, and the current results come from the simulator. That proves the pipeline works end to end, but not how it would perform on a real crane. C-MAPSS and CWRU come from other machines, yet they show the same physics of wear, which makes them the next validation step.
 
 ---
+
+## 7. Competition: who already does this?
+
+Predictive maintenance is an established market. Know the main players:
+
+**Crane makers' own monitoring**
+- **Konecranes TRUCONNECT**: remote monitoring and condition data for Konecranes equipment
+- **Liebherr** and other crane makers offer fleet telematics for their own machines
+
+**Industrial asset-management platforms**
+- **IBM Maximo Application Suite** (Monitor / Health / Predict)
+- **Siemens Insights Hub** (formerly MindSphere)
+- **GE Vernova Asset Performance Management** (formerly GE Digital APM / Predix)
+- **AVEVA** and **Aspen Technology**: asset performance management for process industries
+
+**Condition-monitoring specialists**
+- **Augury**: AI machine health from vibration sensors
+- **SKF**: bearing condition monitoring
+- **Uptake**: predictive analytics for heavy equipment fleets
+
+**Cloud building blocks**
+- **Azure IoT**, **AWS IoT** with SageMaker: tools for building your own system (AWS retired its ready-made Lookout for Equipment service)
+
+### How this project differs
+
+Don't claim it beats these products. It is a portfolio project, not a commercial competitor. The honest positioning:
+
+| Commercial platforms | This project |
+|---|---|
+| Often tied to one maker's equipment or a large vendor setup | Open, works with any client that can send an HTTP request |
+| Expensive licences, long rollouts | Lightweight, runs with one `docker compose up` |
+| Models are a black box | Every step is visible: features, models, thresholds |
+| Accuracy is the headline number | Judged on business cost: missed faults, false alarms, downtime avoided |
+
+**What to say:** "Big vendors solve this at enterprise scale. I built the core of such a system end to end, from ingestion and validation through real-time features and ML scoring to alerts and a dashboard, so I understand every piece and the trade-offs between them."
+
+---
+
+## 8. How success is measured
+
+Measured by `python -m crane.train` on 20 simulated cranes the models never saw (28,780 readings), plus a live run of the API:
+
+| Metric | Result | How to say it |
+|---|---|---|
+| Missed-fault rate | 2.1% of faulty readings | "It almost never misses a fault" |
+| False-alarm rate | 13.9% of healthy readings | "That's the price of missing almost nothing, and the 3-in-a-row alert rule filters most of it" |
+| Fault episodes alerted | 91 / 92 | |
+| False alerts | ~3.5 per 1,000 healthy crane-hours (about 1 per crane every 12 days); about half of all alerts | Be honest: half the alerts are false at a 10:1 cost ratio, and the ratio is a single setting |
+| RUL error | MAE 9.9 days (RUL capped at 60) | "Accurate enough to plan a service week, not a service hour" |
+| Failures caught before breakdown | 20 / 20 | Each crane was serviced with about 6 days of life left |
+| Downtime | 60 days reactive vs 10 days predictive = **83% avoided** | Assumes 3 days per breakdown, 0.5 days per planned service |
+| Model scoring time | ~6 ms per reading | |
+| End-to-end latency | p50 16 ms, p95 17 ms (PostgreSQL) | Far below the 1-second upload interval |
+| Capacity | ~50–65 readings/s per API process | "One process handles a 50-crane site; beyond that, Redis plus more workers" |
+
+Always add: *"These are on simulated data, so they show the system works, not how accurate it would be on real cranes."*
+
+---
+
+## 9. Likely interview questions
+
+**Q: Why not just set fixed thresholds, like "alert if temperature > 90 °C"?**
+Fixed thresholds miss combinations. A temperature that is fine at full load is suspicious at no load. Trends also matter: a slow climb is a warning long before a limit is crossed. The models learn these patterns; fixed thresholds can't.
+
+**Q: How do you handle false alarms?**
+Each alert threshold is set from the cost trade-off, not left at a default. Alerts can also require the anomaly to persist over several readings before they fire, which filters one-off sensor noise.
+
+**Q: What happens with bad or missing sensor data?**
+Pydantic rejects readings with wrong types, missing fields or out-of-range values before they reach the models, and the client gets a clear error.
+
+**Q: How would you scale this to thousands of cranes?**
+The per-machine windows currently live in API memory, which works for a single process. To scale out, move the window state to Redis, put a message queue (Kafka) in front of the scoring step, run several API workers behind a load balancer, and move readings to a time-series database such as TimescaleDB.
+
+**Q: How do the models stay accurate over time?**
+Every reading and result is stored, so models can be retrained on new data. Watching for drift (feature distributions moving away from the training data) shows when retraining is needed.
+
+**Q: Why XGBoost instead of deep learning?**
+On tabular, engineered features XGBoost is usually as good or better, much faster, and easier to explain to a maintenance engineer. An LSTM is only kept if it measurably improves results.
+
+**Q: Your data isn't from cranes. Is that a problem?**
+It's a known limitation, and I'd say so. The pipeline doesn't depend on the dataset. Wear shows up the same way in the signals (trends, vibration patterns), and the system is built to be retrained on real crane data.
+
+**Q: What was the hardest part?**
+Three real problems came up while building it:
+1. **Latency.** The first version took ~56 ms just to score a reading. Timing each step showed Isolation Forest costs about 0.1 ms per tree for a single row, so 200 trees took ~22 ms. Halving to 100 trees halved the cost and barely changed accuracy. Then load testing on PostgreSQL showed throughput stuck at 23 readings/s whether 1 or 4 clients were sending. Profiling found scikit-learn's `score_samples` spends about 50 ms of Python overhead on each single reading, and Python's GIL serialises it. The fix was to precompute each tree's leaf scores at training time and score with fast lookups, with an assertion in training that the result matches scikit-learn exactly. Scoring went from ~25 ms to ~6 ms and throughput to ~55 readings/s, with identical model output. Lesson: measure before optimising, since the feature code (0.14 ms) was never the problem.
+2. **False anomalies on new machines.** The first reading from every new crane was flagged as an anomaly. With only one reading in the window, spread and trend are zero, which looks nothing like training data. Every machine would have raised a false alert after each API restart. The fix: the anomaly model only judges full 30-reading windows, both in training and online, with a test that locks this in.
+3. **Alert flapping.** A condition that flickers on and off would raise and clear alerts constantly. Alerts now need 3 readings in a row to raise and 3 clear readings to clear (hysteresis).
+
+**Q: How do you know the system actually helps?**
+The training script replays unseen cranes from new to failure under both policies. Reactive means every crane breaks down (3 days down). Predictive means a crane is serviced when a "service due" alert fires (0.5 days down). All 20 were caught before failure, cutting downtime by 83%.
+
+---
+
+## 10. Limitations and next steps
+
+- Models are trained on simulated data only; C-MAPSS / CWRU replay is next, and real crane data after that
+- About half of the anomaly alerts are false at the current 10:1 cost setting
+- Sliding windows are held in memory, so one API instance only (Redis for scale-out)
+- No authentication on upload routes yet (needed before real deployment)
+- Health score is a simple heuristic (RUL share, halved while anomalous)
+- Next: WebSocket live updates, drift monitoring, automated retraining, maintenance work-order integration
