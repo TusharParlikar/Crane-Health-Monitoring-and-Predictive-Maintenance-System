@@ -90,3 +90,46 @@ curl -X POST localhost:8000/readings -H "Content-Type: application/json" -d '{
 ```
 
 Invalid readings return `422` with the field and the reason. CSV errors also give the line number. The anomaly flag stays `false` until a machine has 30 readings, because a part-filled window can't be judged fairly. (The first call's latency includes model warm-up.)
+
+## Results
+
+From `python -m crane.train` (100 simulated run-to-failure histories: 60 train, 20 validation, 20 test; the test set is 28,780 readings from cranes the models never saw):
+
+| Metric | Result |
+|---|---|
+| Missed-fault rate (anomaly model, per reading) | 2.1% |
+| False-alarm rate (per reading) | 13.9% |
+| Injected fault episodes that raised an alert | 91 / 92 |
+| False anomaly alerts (after the 3-in-a-row filter) | 3.5 per 1,000 healthy crane-hours; 82 of 154 alerts raised |
+| RUL error (MAE, RUL capped at 60 days) | 9.9 days |
+| Failures caught by a "service due" alert before breakdown | 20 / 20 |
+| Average life left unused when serviced | 6.3 days |
+| Downtime: reactive vs predictive | 60 vs 10 days (**83% avoided**) |
+| Model scoring time | ~6 ms per reading |
+| End-to-end latency (PostgreSQL, see [Test results](#test-results)) | p50 16 ms, p95 17 ms |
+
+The anomaly threshold minimises cost with a missed fault costed at 10× a false alarm. That is why missed faults are rare and false alarms are higher: about half of all anomaly alerts are false, around one per crane every 12 days. Raise `COST_FALSE_ALARM` to trade some missed faults for fewer false alerts. Downtime assumes 0.5 days for a planned service and 3 days for a breakdown. All costs are constants at the top of [crane/train.py](crane/train.py); change them to match a real site.
+
+**These numbers come from simulated data.** They show that the pipeline works end to end. They don't measure performance on real cranes.
+
+## Test results
+
+Tested on 2026-10-16/17 on a Windows 11 laptop. The API ran as one uvicorn worker on PostgreSQL 16.2, run locally because Docker isn't installed on that machine.
+
+| Test | Result |
+|---|---|
+| `pytest` on SQLite | 13 / 13 passed |
+| `pytest` on PostgreSQL 16.2 | 13 / 13 passed |
+| Live demo: 10 cranes × 1 reading/s, 180 rounds | 1,800 / 1,800 accepted; p50 23 ms, p95 46 ms; alerts raised and cleared (8 anomaly, 3 service-due) |
+| Max throughput, 1 client sending back-to-back | 54 readings/s; p50 16 ms, p95 17 ms |
+| 4 parallel clients | 57 readings/s combined; p50 65 ms each |
+| 8 parallel clients (run 3 times) | 50–66 readings/s combined; 8 of 4,000 uploads failed in the first run, 0 of 4,000 in each repeat |
+| API restart | Active alerts restored from the database; the first reading after restart still reports them |
+| Dashboard (rendered with Streamlit's test harness against the API) | No errors with 300 machines loaded |
+
+**What this means:**
+- One API process handles about **50–65 cranes** reporting every second. Adding parallel clients doesn't raise that, because scoring is Python and holds the GIL. Beyond that, run several workers with the windows moved to Redis.
+- The 8 failed uploads never reached the server (it logged every request it received as `200 OK`), so they were client-side connection errors under burst load. They didn't reproduce in two reruns. A production client should retry.
+- **Not tested:** the Docker image and `docker compose`, because Docker isn't installed on the test machine.
+
+**Fixed during testing:** the first load test capped at 23 readings/s however many clients sent data. Profiling showed scikit-learn's `IsolationForest.score_samples` spent about 50 ms of Python overhead on each single reading. The API now looks up precomputed per-tree leaf scores, and training checks they match scikit-learn's own scores. That cut scoring from ~25 ms to ~6 ms and more than doubled throughput, with identical model output.
