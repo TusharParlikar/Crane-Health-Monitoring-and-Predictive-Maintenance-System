@@ -47,3 +47,67 @@ This system gives the maintenance team:
 - Longer machine life
 
 ---
+
+## 4. How it works (the architecture)
+
+```
+Crane / simulator ──(1 reading/sec)──► FastAPI upload route
+                                          │
+                                   Pydantic validation
+                                          │
+                              Per-machine sliding window
+                                          │
+                     Feature engineering (rolling stats, trends, FFT)
+                                          │
+                        ┌─────────────────┴─────────────────┐
+                Anomaly model                         RUL model
+              (Isolation Forest)                      (XGBoost)
+                        └─────────────────┬─────────────────┘
+                          Health score + alerts → response
+                                          │
+                                     PostgreSQL
+                                          │
+                              Streamlit fleet dashboard
+```
+
+**Online path (each reading):** validate → add to that machine's window → build features → score with both models → return the result and save it.
+
+**Offline path:** train the models on historical degradation data and save them with joblib. The API loads them once at startup.
+
+---
+
+## 5. Key design decisions (and why)
+
+Interviewers usually care most about this section, so be ready to explain each choice.
+
+| Decision | Why |
+|---|---|
+| **One API route that any client can call** | A real sensor gateway, the simulator and the dataset replay all use the same route, so the code tested in development is the code that runs in production |
+| **Validate every reading with Pydantic** | Sensors send bad data (missing fields, impossible values). Rejecting it at the entry point keeps garbage out of the models and the database |
+| **Per-machine sliding window** | One reading on its own says little. Trends over the last N seconds (rising temperature, growing vibration) carry the real signal |
+| **Isolation Forest for anomalies** | Real fault data is rare and often unlabelled. Isolation Forest is unsupervised: it learns what "normal" looks like and flags readings that differ from it. It is also fast enough to score every second |
+| **XGBoost for RUL** | It is strong on tabular features, fast to train, and easy to explain through feature importance. An LSTM is only added if it clearly beats XGBoost, because it is slower and harder to explain |
+| **Train offline, score online** | Training is slow and done occasionally. Scoring must be fast and run on every reading. Keeping them separate keeps the API quick |
+| **Cost-based evaluation** | A missed fault (the crane breaks) usually costs far more than a false alarm (a technician checks a healthy crane). The alert threshold is chosen to minimise total cost, not to maximise accuracy |
+| **PostgreSQL** | Readings, scores and alerts are structured data that needs history queries, so a relational database fits |
+| **Streamlit dashboard** | It gives a working live dashboard quickly in pure Python, so the time goes into the ML and the API, not front-end code |
+| **Docker Compose** | The API, the database and the dashboard start with one command, on any machine |
+
+---
+
+## 6. Data: where it comes from and why
+
+| Source | Status | Use |
+|---|---|---|
+| **Simulator** ([crane/sim.py](crane/sim.py)) | Built | Each simulated crane wears out over 30–120 days. Temperature and vibration rise as it wears, load and duty cycle vary, and short fault episodes (spikes in heat and vibration) are injected at random. One reading = one simulated operating hour, so a crane's whole life plays out in 12–48 minutes of a live demo |
+| **NASA C-MAPSS** | Next step | A well-known run-to-failure dataset (turbofan engines), to validate the RUL pipeline on real degradation |
+| **CWRU bearing data** | Next step | Real labelled bearing vibration data (healthy vs faulty), to check the anomaly features on real faults |
+
+**How the simulator works (be ready to explain):**
+- Wear goes from 0 (new) to 1 (failed) along a curve, `(age / lifetime) ^ shape`. Most damage shows late in life, as in real machines.
+- Temperature = base + load effect + duty effect + 30 °C × wear + noise. Vibration grows with wear squared, so it rises sharply near the end.
+- Because the true remaining life is known for every reading, RUL error and "caught before failure" can be measured exactly.
+
+**Be upfront about this:** there is no public run-to-failure dataset for cranes, and the current results come from the simulator. That proves the pipeline works end to end, but not how it would perform on a real crane. C-MAPSS and CWRU come from other machines, yet they show the same physics of wear, which makes them the next validation step.
+
+---
