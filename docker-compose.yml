@@ -1,0 +1,46 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: crane
+      POSTGRES_PASSWORD: crane  # local development only
+      POSTGRES_DB: crane
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crane"]
+      interval: 2s
+      retries: 30
+
+  api:
+    build: .
+    image: crane-health
+    command: uvicorn crane.api:app --host 0.0.0.0 --port 8000
+    environment:
+      DATABASE_URL: postgresql+psycopg://crane:crane@db:5432/crane
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  dashboard:
+    build: .
+    image: crane-health
+    command: streamlit run crane/dashboard.py --server.address 0.0.0.0 --server.port 8501
+    environment:
+      API_URL: http://api:8000
+    depends_on:
+      - api
+    ports:
+      - "8501:8501"
+
+  simulator:
+    build: .
+    image: crane-health
+    command: python -m crane.client --api http://api:8000 --machines 10
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
